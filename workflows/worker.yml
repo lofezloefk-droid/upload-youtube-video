@@ -1,0 +1,510 @@
+
+name: Upload Video to YouTube
+
+on:
+  workflow_dispatch:
+    inputs:
+      google_client_id:
+        description: "Google Drive Client ID"
+        required: true
+        type: string
+      google_client_secret:
+        description: "Google Drive Client Secret"
+        required: true
+        type: string
+      google_refresh_token:
+        description: "Google Drive Refresh Token"
+        required: true
+        type: string
+      youtube_client_id:
+        description: "YouTube Client ID"
+        required: true
+        type: string
+      youtube_client_secret:
+        description: "YouTube Client Secret"
+        required: true
+        type: string
+      youtube_refresh_token:
+        description: "YouTube Refresh Token"
+        required: true
+        type: string
+      video_file_id:
+        description: "Google Drive Video File ID"
+        required: true
+        type: string
+      title:
+        description: "Video Title"
+        required: true
+        type: string
+      description:
+        description: "Video Description"
+        required: false
+        type: string
+        default: ""
+      privacy_status:
+        description: "YouTube Privacy Status"
+        required: true
+        type: string
+        default: "public"
+      category_id:
+        description: "YouTube Category ID"
+        required: true
+        type: string
+        default: "25"
+      playlist_name:
+        description: "Playlist Name"
+        required: false
+        type: string
+        default: ""
+      callback_url:
+        description: "n8n callback URL"
+        required: true
+        type: string
+      page_id:
+        description: "Facebook Page ID (optional)"
+        required: false
+        type: string
+        default: ""
+      access_token:
+        description: "Facebook Page Access Token (optional)"
+        required: false
+        type: string
+        default: ""
+
+jobs:
+  upload:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install google-auth google-auth-oauthlib google-auth-httplib2 google-api-python-client requests
+
+      - name: Mask credentials
+        env:
+          GOOGLE_CLIENT_ID: ${{ inputs.google_client_id }}
+          GOOGLE_CLIENT_SECRET: ${{ inputs.google_client_secret }}
+          GOOGLE_REFRESH_TOKEN: ${{ inputs.google_refresh_token }}
+          YOUTUBE_CLIENT_ID: ${{ inputs.youtube_client_id }}
+          YOUTUBE_CLIENT_SECRET: ${{ inputs.youtube_client_secret }}
+          YOUTUBE_REFRESH_TOKEN: ${{ inputs.youtube_refresh_token }}
+          FACEBOOK_ACCESS_TOKEN: ${{ inputs.access_token }}
+        run: |
+          for name in \
+            GOOGLE_CLIENT_ID \
+            GOOGLE_CLIENT_SECRET \
+            GOOGLE_REFRESH_TOKEN \
+            YOUTUBE_CLIENT_ID \
+            YOUTUBE_CLIENT_SECRET \
+            YOUTUBE_REFRESH_TOKEN \
+            FACEBOOK_ACCESS_TOKEN
+          do
+            value="${!name}"
+            if [ -n "$value" ]; then
+              echo "::add-mask::$value"
+            fi
+          done
+
+      - name: Download video from Google Drive
+        env:
+          GOOGLE_CLIENT_ID: ${{ inputs.google_client_id }}
+          GOOGLE_CLIENT_SECRET: ${{ inputs.google_client_secret }}
+          GOOGLE_REFRESH_TOKEN: ${{ inputs.google_refresh_token }}
+          VIDEO_FILE_ID: ${{ inputs.video_file_id }}
+        run: |
+          python <<'PY'
+          import os
+          import sys
+          from google.oauth2.credentials import Credentials
+          from google.auth.transport.requests import Request
+          from googleapiclient.discovery import build
+          from googleapiclient.http import MediaIoBaseDownload
+
+          credentials = Credentials(
+              token=None,
+              refresh_token=os.environ["GOOGLE_REFRESH_TOKEN"],
+              token_uri="https://oauth2.googleapis.com/token",
+              client_id=os.environ["GOOGLE_CLIENT_ID"],
+              client_secret=os.environ["GOOGLE_CLIENT_SECRET"],
+              scopes=["https://www.googleapis.com/auth/drive.readonly"]
+          )
+
+          print("Refreshing Google Drive access token...")
+          credentials.refresh(Request())
+
+          service = build(
+              "drive", "v3",
+              credentials=credentials,
+              cache_discovery=False
+          )
+
+          file_id = os.environ["VIDEO_FILE_ID"]
+          info = service.files().get(
+              fileId=file_id,
+              fields="id,name,size,mimeType"
+          ).execute()
+
+          print(f"File: {info.get('name', 'video.mp4')}")
+
+          if info.get("size"):
+              print(
+                  f"File size: "
+                  f"{int(info['size']) / 1024 / 1024:.2f} MB"
+              )
+
+          request = service.files().get_media(fileId=file_id)
+
+          with open("video.mp4", "wb") as output_file:
+              downloader = MediaIoBaseDownload(
+                  output_file,
+                  request,
+                  chunksize=8 * 1024 * 1024
+              )
+
+              done = False
+              while not done:
+                  status, done = downloader.next_chunk()
+                  if status:
+                      print(
+                          f"Download progress: "
+                          f"{int(status.progress() * 100)}%"
+                      )
+
+          size = os.path.getsize("video.mp4")
+          print(f"Downloaded: {size / 1024 / 1024:.2f} MB")
+
+          if size == 0:
+              print("ERROR: downloaded file is empty.")
+              sys.exit(1)
+          PY
+
+      - name: Upload video to YouTube
+        id: upload
+        env:
+          YOUTUBE_CLIENT_ID: ${{ inputs.youtube_client_id }}
+          YOUTUBE_CLIENT_SECRET: ${{ inputs.youtube_client_secret }}
+          YOUTUBE_REFRESH_TOKEN: ${{ inputs.youtube_refresh_token }}
+          VIDEO_TITLE: ${{ inputs.title }}
+          VIDEO_DESCRIPTION: ${{ inputs.description }}
+          PRIVACY_STATUS: ${{ inputs.privacy_status }}
+          CATEGORY_ID: ${{ inputs.category_id }}
+        run: |
+          python <<'PY'
+          import os
+          import sys
+          import time
+          import json
+          import requests
+          from google.oauth2.credentials import Credentials
+          from google.auth.transport.requests import Request
+
+          credentials = Credentials(
+              token=None,
+              refresh_token=os.environ["YOUTUBE_REFRESH_TOKEN"],
+              token_uri="https://oauth2.googleapis.com/token",
+              client_id=os.environ["YOUTUBE_CLIENT_ID"],
+              client_secret=os.environ["YOUTUBE_CLIENT_SECRET"],
+              scopes=["https://www.googleapis.com/auth/youtube.upload"]
+          )
+
+          print("Refreshing YouTube access token...")
+          credentials.refresh(Request())
+          access_token = credentials.token
+
+          title = os.environ["VIDEO_TITLE"]
+          description = os.environ.get("VIDEO_DESCRIPTION", "")
+          privacy = os.environ.get("PRIVACY_STATUS", "public")
+          category = os.environ.get("CATEGORY_ID", "25")
+          file_size = os.path.getsize("video.mp4")
+
+          metadata = {
+              "snippet": {
+                  "title": title,
+                  "description": description,
+                  "categoryId": category
+              },
+              "status": {
+                  "privacyStatus": privacy,
+                  "selfDeclaredMadeForKids": False
+              }
+          }
+
+          upload_url = (
+              "https://www.googleapis.com/upload/youtube/v3/videos"
+              "?part=snippet,status&uploadType=resumable"
+          )
+
+          headers = {
+              "Authorization": f"Bearer {access_token}",
+              "Content-Type": "application/json; charset=UTF-8",
+              "X-Upload-Content-Length": str(file_size),
+              "X-Upload-Content-Type": "video/mp4"
+          }
+
+          response = requests.post(
+              upload_url,
+              headers=headers,
+              data=json.dumps(metadata).encode("utf-8"),
+              timeout=60
+          )
+
+          if response.status_code not in (200, 201):
+              print(f"YouTube initialization failed: {response.status_code}")
+              print(response.text)
+              sys.exit(1)
+
+          location = response.headers.get("Location")
+          if not location:
+              print("ERROR: YouTube did not return an upload URL.")
+              sys.exit(1)
+
+          chunk_size = 8 * 1024 * 1024
+          uploaded = 0
+          video_id = None
+
+          with open("video.mp4", "rb") as video:
+              while uploaded < file_size:
+                  video.seek(uploaded)
+                  chunk = video.read(chunk_size)
+
+                  if not chunk:
+                      break
+
+                  start = uploaded
+                  end = start + len(chunk) - 1
+
+                  chunk_headers = {
+                      "Authorization": f"Bearer {access_token}",
+                      "Content-Length": str(len(chunk)),
+                      "Content-Range": f"bytes {start}-{end}/{file_size}",
+                      "Content-Type": "video/mp4"
+                  }
+
+                  while True:
+                      try:
+                          result = requests.put(
+                              location,
+                              headers=chunk_headers,
+                              data=chunk,
+                              timeout=300
+                          )
+                      except requests.RequestException as error:
+                          print(f"Network error: {error}. Retrying...")
+                          time.sleep(5)
+                          continue
+
+                      if result.status_code in (200, 201):
+                          video_id = result.json().get("id")
+                          uploaded = file_size
+                          print("YouTube upload completed.")
+                          break
+
+                      if result.status_code == 308:
+                          range_header = result.headers.get("Range")
+                          uploaded = (
+                              int(range_header.split("-")[1]) + 1
+                              if range_header
+                              else end + 1
+                          )
+                          print(
+                              f"Upload progress: "
+                              f"{uploaded / file_size * 100:.2f}%"
+                          )
+                          break
+
+                      if result.status_code in (429, 500, 502, 503, 504):
+                          print(
+                              f"YouTube returned {result.status_code}; retrying."
+                          )
+                          time.sleep(5)
+                          continue
+
+                      print(f"YouTube upload failed: {result.status_code}")
+                      print(result.text)
+                      sys.exit(1)
+
+          if not video_id:
+              print("ERROR: YouTube video ID was not returned.")
+              sys.exit(1)
+
+          video_url = f"https://www.youtube.com/watch?v={video_id}"
+
+          print("YOUTUBE UPLOAD SUCCESS")
+          print(f"VIDEO_ID={video_id}")
+          print(f"VIDEO_URL={video_url}")
+
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              output.write(f"video_id={video_id}\n")
+              output.write(f"video_url={video_url}\n")
+          PY
+
+      - name: Upload video to Facebook Page
+        id: facebook
+        if: ${{ inputs.page_id != '' && inputs.access_token != '' }}
+        env:
+          FACEBOOK_PAGE_ID: ${{ inputs.page_id }}
+          FACEBOOK_ACCESS_TOKEN: ${{ inputs.access_token }}
+          VIDEO_TITLE: ${{ inputs.title }}
+          VIDEO_DESCRIPTION: ${{ inputs.description }}
+        run: |
+          python <<'PY'
+          import os
+          import requests
+
+          page_id = os.environ["FACEBOOK_PAGE_ID"].strip()
+          token = os.environ["FACEBOOK_ACCESS_TOKEN"].strip()
+          title = os.environ.get("VIDEO_TITLE", "")
+          description = os.environ.get("VIDEO_DESCRIPTION", "")
+
+          def set_output(name, value):
+              value = str(value).replace("\r", " ").replace("\n", " ")
+              with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+                  output.write(f"{name}={value}\n")
+
+          def fail(message, video_id=""):
+              set_output("status", "failed")
+              set_output("video_id", video_id)
+              set_output("error", message[:500])
+              print(f"Facebook upload error: {message}")
+
+          if not os.path.isfile("video.mp4"):
+              fail("video.mp4 not found.")
+              raise SystemExit(0)
+
+          # Facebook's feed may show the description as the post text.
+          # Put the same YouTube title at the top of that visible text.
+          if description.strip():
+              post_text = f"{title}\n\n{description}"
+          else:
+              post_text = title
+
+          url = (
+              "https://graph-video.facebook.com/"
+              f"v26.0/{page_id}/videos"
+          )
+
+          print("Uploading video to Facebook Page...")
+          print("Sending the same title and description as YouTube.")
+
+          try:
+              with open("video.mp4", "rb") as video:
+                  response = requests.post(
+                      url,
+                      data={
+                          "access_token": token,
+                          "title": title,
+                          "description": post_text,
+                          "published": "true"
+                      },
+                      files={
+                          "source": ("video.mp4", video, "video/mp4")
+                      },
+                      timeout=(60, 1800)
+                  )
+
+              try:
+                  result = response.json()
+              except ValueError:
+                  result = {}
+
+              if response.ok and result.get("id"):
+                  video_id = str(result["id"])
+
+                  set_output("status", "success")
+                  set_output("video_id", video_id)
+                  set_output("error", "")
+
+                  print("Facebook video upload succeeded.")
+                  print(f"FACEBOOK_VIDEO_ID={video_id}")
+                  print("Facebook post text includes the title and description.")
+              else:
+                  error = result.get("error", {}).get(
+                      "message",
+                      f"HTTP {response.status_code}: {response.text[:300]}"
+                  )
+                  fail(error)
+
+          except Exception as error:
+              fail(str(error))
+
+          PY
+
+      - name: Send result to n8n
+        if: ${{ always() && steps.upload.outcome == 'success' && inputs.callback_url != '' }}
+        env:
+          CALLBACK_URL: ${{ inputs.callback_url }}
+          VIDEO_ID: ${{ steps.upload.outputs.video_id }}
+          VIDEO_URL: ${{ steps.upload.outputs.video_url }}
+          VIDEO_TITLE: ${{ inputs.title }}
+          VIDEO_DESCRIPTION: ${{ inputs.description }}
+          PLAYLIST_NAME: ${{ inputs.playlist_name }}
+          FACEBOOK_STATUS: ${{ steps.facebook.outputs.status || 'skipped' }}
+          FACEBOOK_VIDEO_ID: ${{ steps.facebook.outputs.video_id || '' }}
+          FACEBOOK_ERROR: ${{ steps.facebook.outputs.error || '' }}
+        run: |
+          python <<'PY'
+          import os
+          import sys
+          import requests
+
+          callback_url = os.environ.get("CALLBACK_URL", "")
+          video_id = os.environ.get("VIDEO_ID", "")
+          video_url = os.environ.get("VIDEO_URL", "")
+
+          if not callback_url:
+              print("ERROR: callback URL is empty.")
+              sys.exit(1)
+
+          if not video_id:
+              print("ERROR: YouTube VIDEO_ID is empty.")
+              sys.exit(1)
+
+          payload = {
+              "success": True,
+              "videoId": video_id,
+              "videoUrl": video_url,
+              "title": os.environ.get("VIDEO_TITLE", ""),
+              "description": os.environ.get("VIDEO_DESCRIPTION", ""),
+              "playlistName": os.environ.get("PLAYLIST_NAME", ""),
+              "facebookStatus": os.environ.get(
+                  "FACEBOOK_STATUS", "skipped"
+              ),
+              "facebookVideoId": os.environ.get(
+                  "FACEBOOK_VIDEO_ID", ""
+              ),
+              "facebookError": os.environ.get("FACEBOOK_ERROR", "")
+          }
+
+          print("Sending upload result to n8n...")
+
+          response = requests.post(
+              callback_url,
+              json=payload,
+              timeout=60
+          )
+
+          print(f"Callback HTTP status: {response.status_code}")
+
+          if not 200 <= response.status_code < 300:
+              print("ERROR: n8n callback failed.")
+              print(response.text)
+              sys.exit(1)
+
+          print("n8n callback completed successfully.")
+          print(f"Facebook status: {payload['facebookStatus']}")
+          PY
+
+      - name: Delete temporary video
+        if: always()
+        run: |
+          rm -f video.mp4
